@@ -1,1 +1,17 @@
 
+import argparse
+import sys
+import time
+
+import cv2  # type: ignore[import-not-found]
+import numpy as np
+
+# --- Varsayılan eşikler (OpenCV'de H: 0-179, S: 0-255, V: 0-255) -------------
+H_WIDTH = 10      # kırmızı = [0, H_WIDTH] ∪ [180 - H_WIDTH, 179]
+S_MIN = 120       # düşük doygunluk = soluk/beyazımsı -> kırmızı sayma
+V_MIN = 70        # çok karanlık pikseller -> kırmızı sayma
+MIN_AREA = 800    # px²; bundan küçük lekeler gürültü sayılır
+
+WIN_MAIN = "Kirmizi hedef takibi"
+WIN_MASK = "Maske"
+WIN_TUNE = "Ayar"
