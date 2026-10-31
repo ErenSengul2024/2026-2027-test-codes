@@ -1,3 +1,4 @@
+
 import math
 import sys
 
@@ -5,13 +6,18 @@ DUNYA_YARICAPI_M = 6_371_008.8
 
 PUSULA = ("K", "KD", "D", "GD", "G", "GB", "B", "KB")
 
+# Başlangıçtaki menü seçimleri. Anlamları ters olsun istersen yalnızca bu ikisini değiştir.
 HAZIR_VERI = "0"
 KENDI_VERI = "1"
 
+
 class GecersizKoordinatHatasi(ValueError):
+    """Enlem/boylam sayı değilse veya geçerli aralığın dışındaysa fırlatılır."""
+
 
 def _dogrula(deger, ad, sinir):
-    
+    """Değerin gerçek bir sayı ve [-sinir, +sinir] aralığında olduğunu doğrular."""
+    # bool, int'in alt sınıfıdır; True/False'ı koordinat olarak kabul etmeyiz
     if isinstance(deger, bool) or not isinstance(deger, (int, float)):
         raise GecersizKoordinatHatasi(
             f"{ad} bir sayı olmalı, alınan: {deger!r} ({type(deger).__name__})")
@@ -29,7 +35,7 @@ def _nokta_dogrula(enlem, boylam, etiket):
 
 
 def mesafe(enlem1, boylam1, enlem2, boylam2):
-    
+    """İki nokta arasındaki büyük daire (haversine) mesafesini metre cinsinden döndürür."""
     lat1, lon1 = _nokta_dogrula(enlem1, boylam1, "1. nokta")
     lat2, lon2 = _nokta_dogrula(enlem2, boylam2, "2. nokta")
 
@@ -57,7 +63,7 @@ def yon(enlem1, boylam1, enlem2, boylam2):
     return 0.0 if derece >= 360.0 else derece
 
 
-def pusula_yön(derece):
+def pusula_adi(derece):
 
     return PUSULA[int((derece + 22.5) // 45) % 8]
 
@@ -77,7 +83,7 @@ def rota_tablosu(noktalar):
     cikti = [f"{'Bacak':<10}{'Mesafe (m)':>14}{'Yön (°)':>11}  Pusula",
              "-" * 44]
     for bacak, d, y in satirlar:
-        cikti.append(f"{bacak:<10}{d:>14.2f}{y:>11.2f}  {pusula_yön(y)}")
+        cikti.append(f"{bacak:<10}{d:>14.2f}{y:>11.2f}  {pusula_adi(y)}")
     cikti.append("-" * 44)
     cikti.append(f"{'Toplam':<10}{toplam:>14.2f}   ({toplam / 1000:.3f} km)")
     return "\n".join(cikti), toplam
@@ -102,6 +108,7 @@ VARSAYILAN_ROTA = [
     ("B", 39.8925, 32.7905),
     ("C", 39.8800, 32.7950),
 ]
+
 
 def _sayiya_cevir(metin, ad):
 
@@ -170,4 +177,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
-
