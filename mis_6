@@ -1,0 +1,21 @@
+from google.colab import drive
+drive.mount('/content/gdrive')
+ROOT_DIR = '/content/gdrive/My Drive/dronedata/'
+!pip install ultralytics
+
+import os
+
+from ultralytics import YOLO
+
+# Load a model
+model = YOLO("yolov8n.pt")
+
+# Use the model
+results = model.train(data=os.path.join('/content/gdrive/My Drive/dronedata/drone.yaml'), epochs=100)  # train the model
+results = model.val()
+results = model.predict
+success = model.export()
+
+!scp -r /content/runs '/content/gdrive/My Drive/dronedata/'
+
+# last years drone data. drones will be switched with this years data set + M2 will be added
