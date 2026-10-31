@@ -4,6 +4,35 @@ import sys
 DUNYA_YARICAPI_M = 6371008.8
 PUSULA = ("K", "KD", "D", "GD", "G", "GB", "B", "KB")
 
+def _dogrula(deger, ad, sinir):
+    
+    if isinstance(deger, bool) or not isinstance(deger, (int, float)):
+        raise GecersizKoordinatHatasi(
+            f"{ad} bir sayı olmalı, alınan: {deger!r} ({type(deger).__name__})")
+    if math.isnan(deger) or math.isinf(deger):
+        raise GecersizKoordinatHatasi(f"{ad} sonlu bir sayı olmalı, alınan: {deger}")
+    if abs(deger) > sinir:
+        raise GecersizKoordinatHatasi(
+            f"{ad} -{sinir} ile {sinir} arasında olmalı, alınan: {deger}")
+    return float(deger)
+
+
+def _nokta_dogrula(enlem, boylam, etiket):
+    return (_dogrula(enlem, f"{etiket} enlemi", 90),
+            _dogrula(boylam, f"{etiket} boylamı", 180))
+
+
+def mesafe(enlem1, boylam1, enlem2, boylam2):
+    lat1, lon1 = _nokta_dogrula(enlem1, boylam1, "1. nokta")
+    lat2, lon2 = _nokta_dogrula(enlem2, boylam2, "2. nokta")
+
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = phi2 - phi1
+    dlambda = math.radians(lon2 - lon1)
+
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    a = min(1.0, max(0.0, a))      # kayan nokta hatası a'yı [0,1] dışına itmesin
+    return 2 * DUNYA_YARICAPI_M * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 VARSAYILAN_ROTA = [
     ("A", 39.8860, 32.7810),
