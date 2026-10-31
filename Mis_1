@@ -1,8 +1,14 @@
 import math
 import sys
 
-DUNYA_YARICAPI_M = 6371008.8
+DUNYA_YARICAPI_M = 6_371_008.8
+
 PUSULA = ("K", "KD", "D", "GD", "G", "GB", "B", "KB")
+
+HAZIR_VERI = "0"
+KENDI_VERI = "1"
+
+class GecersizKoordinatHatasi(ValueError):
 
 def _dogrula(deger, ad, sinir):
     
@@ -23,6 +29,7 @@ def _nokta_dogrula(enlem, boylam, etiket):
 
 
 def mesafe(enlem1, boylam1, enlem2, boylam2):
+    
     lat1, lon1 = _nokta_dogrula(enlem1, boylam1, "1. nokta")
     lat2, lon2 = _nokta_dogrula(enlem2, boylam2, "2. nokta")
 
@@ -34,8 +41,133 @@ def mesafe(enlem1, boylam1, enlem2, boylam2):
     a = min(1.0, max(0.0, a))      # kayan nokta hatası a'yı [0,1] dışına itmesin
     return 2 * DUNYA_YARICAPI_M * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
+
+def yon(enlem1, boylam1, enlem2, boylam2):
+
+    lat1, lon1 = _nokta_dogrula(enlem1, boylam1, "1. nokta")
+    lat2, lon2 = _nokta_dogrula(enlem2, boylam2, "2. nokta")
+
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+
+    x = math.sin(dlambda) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+    derece = math.degrees(math.atan2(x, y)) % 360.0
+    # -1e-15 % 360 == 360.0 olabilir; aralığı [0, 360) tut
+    return 0.0 if derece >= 360.0 else derece
+
+
+def pusula_yön(derece):
+
+    return PUSULA[int((derece + 22.5) // 45) % 8]
+
+
+def rota_tablosu(noktalar):
+
+    if len(noktalar) < 2:
+        raise GecersizKoordinatHatasi("Rota için en az 2 nokta gerekir.")
+
+    satirlar, toplam = [], 0.0
+    for (ad1, la1, lo1), (ad2, la2, lo2) in zip(noktalar, noktalar[1:]):
+        d = mesafe(la1, lo1, la2, lo2)
+        y = yon(la1, lo1, la2, lo2)
+        toplam += d
+        satirlar.append((f"{ad1} → {ad2}", d, y))
+
+    cikti = [f"{'Bacak':<10}{'Mesafe (m)':>14}{'Yön (°)':>11}  Pusula",
+             "-" * 44]
+    for bacak, d, y in satirlar:
+        cikti.append(f"{bacak:<10}{d:>14.2f}{y:>11.2f}  {pusula_yön(y)}")
+    cikti.append("-" * 44)
+    cikti.append(f"{'Toplam':<10}{toplam:>14.2f}   ({toplam / 1000:.3f} km)")
+    return "\n".join(cikti), toplam
+
+
+def _nokta_oku(metin, sira):
+
+    parcalar = metin.split(",")
+    if len(parcalar) != 2:
+        raise GecersizKoordinatHatasi(
+            f"{sira}. nokta 'enlem,boylam' biçiminde olmalı, alınan: {metin!r}")
+    try:
+        enlem, boylam = float(parcalar[0]), float(parcalar[1])
+    except ValueError:
+        raise GecersizKoordinatHatasi(
+            f"{sira}. noktadaki değerler sayı olmalı, alınan: {metin!r}") from None
+    return (chr(ord("A") + sira - 1) if sira <= 26 else f"P{sira}", enlem, boylam)
+
+
 VARSAYILAN_ROTA = [
     ("A", 39.8860, 32.7810),
     ("B", 39.8925, 32.7905),
     ("C", 39.8800, 32.7950),
 ]
+
+def _sayiya_cevir(metin, ad):
+
+    try:
+        return float(metin.strip().replace(",", "."))
+    except ValueError:
+        raise GecersizKoordinatHatasi(f"{ad} bir sayı olmalı, alınan: {metin!r}") from None
+
+
+def _sayi_oku(soru, ad, sinir):
+
+    while True:
+        try:
+            return _dogrula(_sayiya_cevir(input(soru), ad), ad, sinir)
+        except GecersizKoordinatHatasi as e:
+            print(f"Hata: {e}. Tekrar dene.", file=sys.stderr)
+
+
+def _mod_sec():
+
+    while True:
+        secim = input(f"Hazır veri için {HAZIR_VERI}, kendi verin için {KENDI_VERI} gir: ").strip()
+        if secim in (HAZIR_VERI, KENDI_VERI):
+            return secim
+        print(f"Hata: Yalnızca {HAZIR_VERI} veya {KENDI_VERI} girebilirsin, alınan: {secim!r}",
+              file=sys.stderr)
+
+
+def _noktalari_iste():
+
+    noktalar = []
+    for ad in ("A", "B", "C"):
+        print(f"\n{ad} noktası:")
+        enlem = _sayi_oku("  Enlem  (-90 ile 90, ör. 39.8860): ", f"{ad} enlemi", 90)
+        boylam = _sayi_oku("  Boylam (-180 ile 180, ör. 32.7810): ", f"{ad} boylamı", 180)
+        noktalar.append((ad, enlem, boylam))
+    return noktalar
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    etkilesimli = not argv
+    try:
+        if argv:
+            noktalar = [_nokta_oku(m, i) for i, m in enumerate(argv, start=1)]
+        elif _mod_sec() == HAZIR_VERI:
+            noktalar = VARSAYILAN_ROTA
+        else:
+            noktalar = _noktalari_iste()
+        tablo, _ = rota_tablosu(noktalar)
+    except GecersizKoordinatHatasi as e:
+        print(f"Hata: {e}", file=sys.stderr)
+        return 1
+    except (EOFError, KeyboardInterrupt):
+        print("\nİptal edildi.", file=sys.stderr)
+        return 1
+
+    if etkilesimli:
+        print("\nKullanılan noktalar:")
+        for ad, enlem, boylam in noktalar:
+            print(f"  {ad}: {enlem}, {boylam}")
+        print()
+    print(tablo)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
