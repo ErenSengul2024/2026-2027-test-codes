@@ -18,4 +18,4 @@ success = model.export()
 
 !scp -r /content/runs '/content/gdrive/My Drive/dronedata/'
 
-# last years drone data. drones will be switched with this years data set + M2 will be added
+# data switched. HSV failed. Open drive link for the code. https://drive.google.com/drive/folders/1OGAOIl2R8tZiKMlqpphqWm0XBfb_zrzM?usp=drive_link
