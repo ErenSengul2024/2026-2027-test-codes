@@ -1,1 +1,555 @@
-#I will use Mis_2 detect
+
+import argparse
+import csv
+import math
+import os
+import sys
+import time
+from datetime import datetime, timedelta
+
+import cv2
+import numpy as np
+
+from red_target_tracker import (
+    red_mask, find_candidates, draw_text_panel, open_source,
+    H_WIDTH, S_MIN, V_MIN, MIN_AREA,
+    CYAN, GREEN, YELLOW, GRAY, RED,
+)
+
+WHITE = (255, 255, 255)
+MAGENTA = (255, 0, 255)
+
+MODES = ("auto", "red", "qr")
+MODE_LABEL = {"auto": "OTO", "red": "KIRMIZI", "qr": "QR"}
+WIN_MAIN = "Gorev 3 - Kilitlenme"
+WIN_MASK = "Maske"
+QR_FLASH_SEC = 4.0      
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Vuruş alanı + kilitlenme + QR modu")
+    p.add_argument("--source", default="0",
+                   help="Kamera indeksi (0, 1, ...) veya video dosyası yolu")
+    p.add_argument("--mode", choices=MODES, default="auto",
+                   help="auto = kırmızı takip + alanda QR önceliği | red | qr")
+    p.add_argument("--width", type=int, default=640,
+                   help="İşleme genişliği; daha büyük kareler küçültülür")
+
+    p.add_argument("--h-width", type=int, default=H_WIDTH, help="Kırmızı hue toleransı")
+    p.add_argument("--s-min", type=int, default=S_MIN, help="Minimum doygunluk")
+    p.add_argument("--v-min", type=int, default=V_MIN, help="Minimum parlaklık")
+    p.add_argument("--min-area", type=int, default=MIN_AREA, help="Minimum alan (px²)")
+    p.add_argument("--min-circularity", type=float, default=0.0, help="0-1, 0 = kapalı")
+
+    p.add_argument("--zone-area", type=float, default=0.25,
+                   help="Vuruş alanının görüntü alanına oranı (0.25 = %%25)")
+    p.add_argument("--lock-time", type=float, default=4.0,
+                   help="Kilitlenme için alanda kesintisiz kalma süresi (sn)")
+    p.add_argument("--grace", type=float, default=0.2,
+                   help="Bundan kısa hedef kaybı sayacı sıfırlamaz (sn)")
+    p.add_argument("--qr-hold", type=float, default=0.3,
+                   help="QR görünmese bile odağın bu kadar sn korunması (titreşim önleme)")
+    p.add_argument("--qr-min-area", type=int, default=400,
+                   help="Bundan küçük QR adayları yok sayılır (px²)")
+    p.add_argument("--log", default="kilitlenme_kaydi.csv",
+                   help="Kilitlenme ve QR olaylarının yazılacağı CSV dosyası")
+    p.add_argument("--record", metavar="DOSYA", help="İşlenmiş görüntüyü mp4 olarak kaydet")
+    p.add_argument("--no-display", action="store_true", help="Pencere açma (test için)")
+    p.add_argument("--max-frames", type=int, default=0, help="N kare sonra dur (0 = sınırsız)")
+    args = p.parse_args()
+    if not 0 < args.zone_area <= 1:
+        p.error("--zone-area 0 ile 1 arasında olmalı (örn. 0.25)")
+    return args
+
+_FONT_PATHS = [
+    "C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
+_TR_FOLD = str.maketrans("İıŞşĞğÜüÖöÇç", "IiSsGgUuOoCc")
+_font_cache = {}
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _FONT_FILE = next((f for f in _FONT_PATHS if os.path.exists(f)), None)
+except ImportError:  
+    _FONT_FILE = None
+
+
+def _pil_font(size):
+    if size not in _font_cache:
+        _font_cache[size] = ImageFont.truetype(_FONT_FILE, size)
+    return _font_cache[size]
+
+
+def text_size(text, size):
+    """(genişlik, yükseklik) piksel."""
+    if _FONT_FILE:
+        l, t, r, b = _pil_font(size).getbbox(text, stroke_width=2)
+        return r - l, b - t
+    (w, h), _ = cv2.getTextSize(text.translate(_TR_FOLD), cv2.FONT_HERSHEY_SIMPLEX,
+                                size / 30.0, max(1, round(size / 15)))
+    return w, h
+
+
+def put_text(frame, text, org, size=22, color=WHITE):
+    """org = metnin SOL-ÜST köşesi. Türkçe karakterleri doğru çizer, siyah kenarlıdır."""
+    x, y = int(org[0]), int(org[1])
+    if _FONT_FILE:
+        font = _pil_font(size)
+        l, t, r, b = font.getbbox(text, stroke_width=2)
+        w, h = r - l, b - t
+        fill = Image.new("L", (w, h), 0)
+        edge = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(fill).text((-l, -t), text, font=font, fill=255)
+        ImageDraw.Draw(edge).text((-l, -t), text, font=font, fill=255, stroke_width=2)
+        fill, edge = np.asarray(fill, np.float32) / 255, np.asarray(edge, np.float32) / 255
+        x0, y0 = max(x, 0), max(y, 0)
+        x1, y1 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
+        if x1 <= x0 or y1 <= y0:
+            return
+        sx, sy = x0 - x, y0 - y
+        fill = fill[sy:sy + (y1 - y0), sx:sx + (x1 - x0), None]
+        edge = edge[sy:sy + (y1 - y0), sx:sx + (x1 - x0), None]
+        roi = frame[y0:y1, x0:x1].astype(np.float32)
+        roi = roi * (1 - edge)       
+        roi = roi * (1 - fill) + np.array(color, np.float32) * fill 
+        frame[y0:y1, x0:x1] = roi.astype(np.uint8)
+        return
+
+    scale, thick = size / 30.0, max(1, round(size / 15))
+    folded = text.translate(_TR_FOLD)
+    (_, h), _ = cv2.getTextSize(folded, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+    base = (x, y + h)
+    cv2.putText(frame, folded, base, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick + 3, cv2.LINE_AA)
+    cv2.putText(frame, folded, base, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+    for i, ch in enumerate(text):
+        if ch == "İ":
+            x_i = x + cv2.getTextSize(folded[:i], cv2.FONT_HERSHEY_SIMPLEX, scale, thick)[0][0]
+            w_i = cv2.getTextSize(folded[i], cv2.FONT_HERSHEY_SIMPLEX, scale, thick)[0][0]
+            cv2.circle(frame, (x_i + w_i // 2, y - 2), max(2, thick), color, -1, cv2.LINE_AA)
+
+
+def fit_text(text, size, max_w):
+
+    text = " ".join(text.split())
+    if text_size(text, size)[0] <= max_w:
+        return text
+    while text and text_size(text + "...", size)[0] > max_w:
+        text = text[:-1]
+    return text + "..."
+
+
+def make_zone(w, h, area_ratio):
+    side = math.sqrt(area_ratio)
+    zw, zh = int(round(w * side)), int(round(h * side))
+    x0, y0 = (w - zw) // 2, (h - zh) // 2
+    return x0, y0, x0 + zw, y0 + zh
+
+
+def in_rect(pt, rect):
+    return rect[0] <= pt[0] <= rect[2] and rect[1] <= pt[1] <= rect[3]
+
+
+class LockLogic:
+
+    def __init__(self, lock_time, grace):
+        self.lock_time, self.grace = lock_time, grace
+        self._reset()
+
+    def _reset(self):
+        self.enter_t = None      
+        self.last_in_t = None    
+        self.lock_t = None       
+    @property
+    def locked(self):
+        return self.lock_t is not None
+
+    def elapsed(self, t):
+        return 0.0 if self.enter_t is None else min(t - self.enter_t, self.lock_time)
+
+    def _break(self):
+        ev = ("lock_end", self.enter_t, self.lock_t, self.last_in_t) if self.locked else None
+        self._reset()
+        return ev
+
+    def update(self, t, in_zone):
+        events = []
+        if self.last_in_t is not None and t - self.last_in_t > self.grace + 1e-6:
+            ev = self._break()                   
+            if ev:
+                events.append(ev)
+        if in_zone:
+            if self.enter_t is None:
+                self.enter_t = t
+            self.last_in_t = t
+            if not self.locked and t - self.enter_t >= self.lock_time - 1e-6:
+                self.lock_t = t
+                events.append(("lock_start", self.enter_t, t))
+        return events
+
+    def finish(self):
+        ev = self._break()
+        return [ev] if ev else []
+
+
+# =============================================================================
+#  QR kod
+# =============================================================================
+def make_qr_detector():
+
+    return cv2.QRCodeDetectorAruco() if hasattr(cv2, "QRCodeDetectorAruco") else cv2.QRCodeDetector()
+
+
+def detect_qr(detector, frame, min_area):
+
+    try:
+        ok, pts = detector.detectMulti(frame)
+        if not ok or pts is None:
+            ok, pts = detector.detect(frame)             # tekli QR yedeği
+        if not ok or pts is None:
+            return []
+        pts = np.asarray(pts, np.float32).reshape(-1, 4, 2)
+        texts = [""] * len(pts)
+        try:
+            _, decoded, _ = detector.decodeMulti(frame, pts)
+            if decoded is not None and len(decoded) == len(pts):
+                texts = list(decoded)
+        except (cv2.error, ValueError):
+            pass
+        if len(pts) == 1 and not texts[0]:
+            texts[0] = detector.decode(frame, pts[0])[0]
+    except (cv2.error, UnicodeError):
+        return []
+    found = []
+    for text, poly in zip(texts, pts):
+        area = cv2.contourArea(poly)
+        if area < min_area:
+            continue
+        cx, cy = poly.mean(axis=0)
+        found.append({"text": text, "poly": poly.astype(np.int32),
+                      "center": (int(cx), int(cy)), "area": area})
+    found.sort(key=lambda d: d["area"], reverse=True)
+    return found
+
+
+class QrFocus:
+
+
+    def __init__(self, hold):
+        self.hold = hold
+        self.active = False
+        self.text = ""
+        self.poly = None
+        self.center = None
+        self.last_seen = None
+        self.read_t = None          # bu oturumda içeriğin ilk okunduğu an
+        self.flash_until = -1.0
+
+    def _close(self):
+        ev = ("end", self.read_t, self.last_seen, self.text) if self.text else None
+        self.active, self.text, self.read_t = False, "", None
+        return ev
+
+    def update(self, t, det):
+        """det: bu karedeki seçilmiş QR (veya None). Olay listesi döndürür."""
+        events = []
+        if det is not None:
+            if self.active and det["text"] and self.text and det["text"] != self.text:
+                events.append(self._close())               # başka bir QR gösterildi
+            if not self.active:
+                self.active, self.text, self.read_t = True, "", None
+            self.poly, self.center, self.last_seen = det["poly"], det["center"], t
+            if det["text"]:
+                if self.read_t is None:
+                    self.read_t = t
+                    self.flash_until = t + QR_FLASH_SEC
+                    events.append(("read", t, det["text"]))
+                self.text = det["text"]
+        elif self.active and t - self.last_seen > self.hold:
+            events.append(self._close())
+        return [e for e in events if e]
+
+    def finish(self):
+        ev = self._close() if self.active else None
+        return [ev] if ev else []
+
+
+class EventLog:
+    HEADER = ["olay", "baslangic", "bitis", "sure_sn", "baslangic_t_sn", "bitis_t_sn", "detay"]
+
+    def __init__(self, path, start_wall):
+        self.start_wall = start_wall
+        new = not os.path.exists(path) or os.path.getsize(path) == 0
+        self.f = open(path, "a", newline="", encoding="utf-8-sig")
+        self.w = csv.writer(self.f)
+        if new:
+            self.w.writerow(self.HEADER)
+            self.f.flush()
+
+    def stamp(self, t):
+        return (self.start_wall + timedelta(seconds=t)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    def clock(self, t):
+        return self.stamp(t)[11:]
+
+    def _row(self, olay, t0, t1, detay):
+        self.w.writerow([olay, self.stamp(t0), self.stamp(t1), f"{t1 - t0:.2f}",
+                         f"{t0:.2f}", f"{t1:.2f}", detay])
+        self.f.flush()
+
+    def lock(self, enter_t, start_t, end_t):
+        self._row("KILITLENME", start_t, end_t, f"alana giris: {self.stamp(enter_t)}")
+
+    def qr(self, read_t, end_t, text):
+        self._row("QR_OKUMA", read_t, end_t, text)
+
+    def close(self):
+        self.f.close()
+
+
+class FrameClock:
+
+
+    def __init__(self, cap, is_file):
+        self.is_file = is_file
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        self.fps = fps if fps and fps > 1 else 30.0
+        self.index = -1
+        self.t0 = None
+
+    def tick(self):
+        self.index += 1
+        now = time.perf_counter()
+        if self.t0 is None:
+            self.t0 = now
+        return self.index / self.fps if self.is_file else now - self.t0
+
+
+def draw_zone(frame, zone, color, thick, locked):
+    x0, y0, x1, y1 = zone
+    if locked: 
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), GREEN, -1)
+        cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), color, thick)
+    label = "VURUS ALANI"
+    lw, _ = text_size(label, 16)
+    put_text(frame, label, (x1 - lw, max(y0 - 24, 2)), 16, color)
+
+
+def draw_progress(frame, zone, ratio, locked):
+    x0, _, x1, y1 = zone
+    y = y1 + 6
+    cv2.rectangle(frame, (x0, y), (x1, y + 9), (0, 0, 0), -1)
+    cv2.rectangle(frame, (x0, y), (x0 + int((x1 - x0) * ratio), y + 9), GREEN if locked else YELLOW, -1)
+    cv2.rectangle(frame, (x0, y), (x1, y + 9), WHITE, 1)
+
+
+def draw_banner(frame, text, y, color, size=40):
+    w, _ = text_size(text, size)
+    put_text(frame, text, ((frame.shape[1] - w) // 2, y), size, color)
+
+
+def draw_red_target(frame, candidates, img_center, locked):
+    for c in candidates[1:]: 
+        x, y, bw, bh = c["bbox"]
+        cv2.rectangle(frame, (x, y), (x + bw, y + bh), GRAY, 1)
+    x, y, bw, bh = candidates[0]["bbox"]
+    cx, cy = candidates[0]["center"]
+    cv2.rectangle(frame, (x, y), (x + bw, y + bh), GREEN, 3 if locked else 2)
+    cv2.putText(frame, "HEDEF", (x, max(y - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, GREEN, 2, cv2.LINE_AA)
+    cv2.line(frame, img_center, (cx, cy), CYAN, 1, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), 5, YELLOW, -1, cv2.LINE_AA)
+    cv2.drawMarker(frame, (cx, cy), YELLOW, cv2.MARKER_CROSS, 20, 1, cv2.LINE_AA)
+
+
+def draw_qr_target(frame, qr, img_center):
+    cv2.polylines(frame, [qr.poly.reshape(-1, 1, 2)], True, MAGENTA, 3, cv2.LINE_AA)
+    cx, cy = qr.center
+    cv2.line(frame, img_center, (cx, cy), CYAN, 1, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), 5, YELLOW, -1, cv2.LINE_AA)
+    x, y = qr.poly[:, 0].min(), qr.poly[:, 1].min()
+    cv2.putText(frame, "QR HEDEF", (int(x), max(int(y) - 8, 14)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, MAGENTA, 2, cv2.LINE_AA)
+
+
+def draw_qr_bar(frame, text):
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, h - 40), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+    shown = fit_text(f"QR: {text}", 22, w - 20) if text else "QR algilandi, okunuyor..."
+    put_text(frame, shown, (10, h - 34), 22, MAGENTA if text else YELLOW)
+
+
+def main():
+    args = parse_args()
+    source = int(args.source) if args.source.isdigit() else args.source
+    cap = open_source(source)
+    if not cap.isOpened():
+        sys.exit(f"HATA: kaynak açılamadı: {args.source}")
+
+    is_file = not isinstance(source, int)
+    show = not args.no_display
+    mode = args.mode
+    detector = make_qr_detector()
+    clock = FrameClock(cap, is_file)
+    lock = LockLogic(args.lock_time, args.grace)
+    qr = QrFocus(args.qr_hold)
+    log = None
+
+    writer, out_fps, written = None, 30.0, 0
+    show_mask = False
+    fps, frames, prev = 0.0, 0, time.perf_counter()
+    t_start = prev
+    t = 0.0
+
+    def handle_lock(events):
+        for ev in events:
+            if ev[0] == "lock_start":
+                print(f"[{log.clock(ev[2])}] KILITLENDI (hedef {args.lock_time:g} sn kesintisiz alanda kaldi)")
+            else:
+                _, enter_t, start_t, end_t = ev
+                log.lock(enter_t, start_t, end_t)
+                print(f"[{log.clock(end_t)}] KILIT BITTI (sure {end_t - start_t:.2f} sn)")
+
+    def handle_qr(events):
+        for ev in events:
+            if ev[0] == "read":
+                print(f"[{log.clock(ev[1])}] QR OKUNDU: {ev[2]}")
+            else:
+                _, read_t, end_t, text = ev
+                log.qr(read_t, end_t, text)
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break       
+            t = clock.tick()
+            if log is None:
+                log = EventLog(args.log, datetime.now())
+
+            if frame.shape[1] > args.width:
+                s = args.width / frame.shape[1]
+                frame = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+            h, w = frame.shape[:2]
+            zone = make_zone(w, h, args.zone_area)
+            img_center = (w // 2, h // 2)
+
+            best_qr = None
+            if mode in ("auto", "qr"):
+                dets = detect_qr(detector, frame, args.qr_min_area)
+                if mode == "auto":
+                    dets = [d for d in dets if in_rect(d["center"], zone)]
+                best_qr = dets[0] if dets else None
+            handle_qr(qr.update(t, best_qr))
+            qr_focus = qr.active and mode != "red"
+
+            mask, candidates = None, []
+            if not qr_focus and mode in ("auto", "red"):
+                mask = red_mask(frame, args.h_width, args.s_min, args.v_min)
+                candidates = find_candidates(mask, args.min_area, args.min_circularity)
+
+            red_in_zone = bool(candidates) and in_rect(candidates[0]["center"], zone)
+            handle_lock(lock.update(t, red_in_zone))
+
+            now = time.perf_counter()
+            dt, prev = now - prev, now
+            if dt > 0:
+                fps = 1.0 / dt if fps == 0 else 0.9 * fps + 0.1 * (1.0 / dt)
+
+            cv2.drawMarker(frame, img_center, CYAN, cv2.MARKER_CROSS, 24, 1, cv2.LINE_AA)
+            if mode != "qr":
+                counting = lock.enter_t is not None
+                zone_color = GREEN if lock.locked else (YELLOW if counting else WHITE)
+                draw_zone(frame, zone, zone_color, 3 if lock.locked else 2, lock.locked)
+                if counting:
+                    draw_progress(frame, zone, lock.elapsed(t) / args.lock_time, lock.locked)
+
+            lines = [(f"FPS: {fps:5.1f}", GREEN), (f"Mod: {MODE_LABEL[mode]}", WHITE)]
+            if qr_focus:
+                lines.append(("Hedef: QR KOD", MAGENTA))
+                if qr.center:
+                    lines += [(f"Merkez: ({qr.center[0]}, {qr.center[1]})", WHITE),
+                              (f"Sapma: {qr.center[0] - img_center[0]:+d},{qr.center[1] - img_center[1]:+d} px", YELLOW)]
+                draw_qr_target(frame, qr, img_center)
+                draw_qr_bar(frame, qr.text)
+            elif candidates:
+                cx, cy = candidates[0]["center"]
+                lines += [(f"Hedef: KIRMIZI ({len(candidates)})", WHITE),
+                          (f"Merkez: ({cx}, {cy})", WHITE),
+                          (f"Sapma: {cx - img_center[0]:+d},{cy - img_center[1]:+d} px", YELLOW)]
+                draw_red_target(frame, candidates, img_center, lock.locked)
+            else:
+                lines.append(("QR bekleniyor" if mode == "qr" else "Hedef yok", RED))
+            if mode != "qr":
+                if lock.locked:
+                    lines.append(("Kilit: AKTIF", GREEN))
+                elif lock.enter_t is not None:
+                    lines.append((f"Kilit: {lock.elapsed(t):.1f}/{args.lock_time:g} sn", YELLOW))
+                else:
+                    lines.append(("Kilit: -", GRAY))
+            draw_text_panel(frame, lines)
+
+            banner_y = zone[3] + 22
+            if lock.locked:
+                draw_banner(frame, "KİLİTLENDİ", banner_y, GREEN)
+            elif t <= qr.flash_until and qr_focus and qr.text:
+                draw_banner(frame, "QR OKUNDU", banner_y, MAGENTA)
+
+            frames += 1
+
+            if args.record:
+                if writer is None:
+                    src_fps = cap.get(cv2.CAP_PROP_FPS)
+                    out_fps = src_fps if src_fps and src_fps > 1 else 30.0
+                    writer = cv2.VideoWriter(args.record, cv2.VideoWriter_fourcc(*"mp4v"),
+                                             out_fps, (w, h))
+                target_n = int(t * out_fps + 1e-6) + 1
+                while written < target_n:
+                    writer.write(frame)
+                    written += 1
+
+            if show:
+                cv2.imshow(WIN_MAIN, frame)
+                if show_mask and mask is not None:
+                    cv2.imshow(WIN_MASK, mask)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    break
+                if key == ord("m"):
+                    show_mask = not show_mask
+                    if not show_mask:
+                        cv2.destroyWindow(WIN_MASK)
+                if key == ord("t"):            
+                    handle_lock(lock.finish())
+                    handle_qr(qr.finish())
+                    mode = MODES[(MODES.index(mode) + 1) % len(MODES)]
+
+            if args.max_frames and frames >= args.max_frames:
+                break
+    finally:
+        if log is not None:                
+            handle_lock(lock.finish())
+            handle_qr(qr.finish())
+            log.close()
+        cap.release()
+        if writer is not None:
+            writer.release()
+        cv2.destroyAllWindows()
+
+    elapsed = time.perf_counter() - t_start
+    if frames:
+        print(f"{frames} kare işlendi, ortalama {frames / elapsed:.1f} FPS | kayıt dosyası: {args.log}")
+    else:
+        print("HATA: Hiç görüntü alınamadı. Kamera başka bir uygulamada açık olabilir; "
+              "--source 1 deneyin.", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
